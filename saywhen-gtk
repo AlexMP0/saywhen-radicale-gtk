@@ -1,0 +1,191 @@
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+"""
+saywhen-gtk — diálogo rápido (GTK 4 + libadwaita) para crear eventos en Radicale.
+
+Una línea de texto, vista previa en vivo de lo que se entendió, Enter para
+guardar y Esc para cerrar. Reutiliza el parser, la configuración y el cliente
+CalDAV del script `saywhen` (debe estar en la misma carpeta o en el PATH).
+
+Asigna un atajo de teclado de tu escritorio al comando `saywhen-gtk`.
+Requiere GTK 4 y libadwaita ≥ 1.4 (GNOME 45+).
+"""
+import importlib.machinery
+import importlib.util
+import shutil
+import sys
+import threading
+from pathlib import Path
+
+import gi
+
+gi.require_version("Gtk", "4.0")
+gi.require_version("Gdk", "4.0")
+gi.require_version("Adw", "1")
+from gi.repository import Adw, Gdk, GLib, Gtk  # noqa: E402
+
+
+def load_core():
+    """Carga el script `saywhen` (sin extensión .py) como módulo."""
+    here = Path(__file__).resolve().parent
+    found = shutil.which("saywhen")
+    for cand in (here / "saywhen", Path(found) if found else None):
+        if cand and cand.is_file():
+            loader = importlib.machinery.SourceFileLoader("saywhen_core", str(cand))
+            spec = importlib.util.spec_from_loader("saywhen_core", loader)
+            mod = importlib.util.module_from_spec(spec)
+            sys.modules["saywhen_core"] = mod          # necesario para @dataclass
+            loader.exec_module(mod)
+            return mod
+    sys.exit("No encuentro el script `saywhen` (ponlo junto a saywhen-gtk o en el PATH).")
+
+
+core = load_core()
+ENTRY_TITLE = "Qué y cuándo — p. ej. «Gimnasio todos los martes y viernes a las 9»"
+DEFAULT_HINT = "Enter para guardar · Esc para cerrar"
+
+
+def esc(s: str) -> str:
+    return GLib.markup_escape_text(s)
+
+
+class QuickWindow(Adw.ApplicationWindow):
+    def __init__(self, app, cfg):
+        super().__init__(application=app, title="SayWhen")
+        self.cfg = cfg
+        self.event = None
+        self.busy = False
+        self.set_default_size(520, -1)
+        self.set_resizable(False)
+
+        # Campo de texto (fila de libadwaita en una lista con aspecto de tarjeta)
+        self.entry = Adw.EntryRow(title=ENTRY_TITLE)
+        self.entry.connect("changed", self.on_changed)
+        self.entry.connect("entry-activated", self.on_activate)
+        entry_list = Gtk.ListBox(selection_mode=Gtk.SelectionMode.NONE)
+        entry_list.add_css_class("boxed-list")
+        entry_list.append(self.entry)
+
+        # Vista previa de lo que se entendió
+        self.row = Adw.ActionRow()
+        self.row.add_prefix(Gtk.Image.new_from_icon_name("x-office-calendar-symbolic"))
+        self.preview = Gtk.ListBox(selection_mode=Gtk.SelectionMode.NONE, visible=False)
+        self.preview.add_css_class("boxed-list")
+        self.preview.append(self.row)
+
+        self.status = Gtk.Label(xalign=0, wrap=True, margin_start=6, margin_end=6)
+
+        box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=14,
+                      margin_top=6, margin_bottom=18, margin_start=18, margin_end=18)
+        box.append(entry_list)
+        box.append(self.preview)
+        box.append(self.status)
+
+        toolbar = Adw.ToolbarView()
+        toolbar.add_top_bar(Adw.HeaderBar(decoration_layout=":close"))
+        toolbar.set_content(box)
+        self.set_content(toolbar)
+
+        keys = Gtk.EventControllerKey()
+        keys.set_propagation_phase(Gtk.PropagationPhase.CAPTURE)
+        keys.connect("key-pressed", self.on_key)
+        self.add_controller(keys)
+
+        if not cfg.url:
+            self.show_status("Falta configurar el servidor: ejecuta «saywhen --init».", "error")
+        else:
+            self.show_status(DEFAULT_HINT, "dim-label")
+        self.entry.grab_focus()
+
+    # — utilidades —
+    def show_status(self, text, css="dim-label"):
+        for c in ("error", "success", "dim-label", "caption"):
+            self.status.remove_css_class(c)
+        self.status.add_css_class(css)
+        if css == "dim-label":
+            self.status.add_css_class("caption")
+        self.status.set_text(text)
+
+    def dismiss(self):
+        self.close()
+        return False
+
+    def on_key(self, _ctrl, keyval, _code, _state):
+        if keyval == Gdk.KEY_Escape:
+            self.dismiss()
+            return True
+        return False
+
+    # — vista previa en vivo —
+    def on_changed(self, entry):
+        if self.busy:
+            return
+        text = entry.get_text()
+        self.event = None
+        if not text.strip():
+            self.preview.set_visible(False)
+            self.show_status(DEFAULT_HINT)
+            return
+        try:
+            ev = core.parse(text, self.cfg.now(), self.cfg.date_order,
+                            self.cfg.default_minutes, self.cfg.pm_guess)
+        except core.ParseError as e:
+            self.preview.set_visible(False)
+            self.show_status(f"Todavía no entiendo: {e}")
+            return
+        self.event = ev
+        sub = core.when_text(ev)
+        if ev.recur_text:
+            sub += f"\n↻ {ev.recur_text}"
+        self.row.set_title(esc(ev.title))
+        self.row.set_subtitle(esc(sub))
+        self.preview.set_visible(True)
+        self.show_status(DEFAULT_HINT)
+
+    # — guardar —
+    def on_activate(self, _entry):
+        if self.busy or self.event is None:
+            return
+        self.busy = True
+        self.entry.set_editable(False)       # no set_sensitive(): perdería el foco sin avisar
+        ev, cfg = self.event, self.cfg
+        self.show_status("Guardando…")
+        now = cfg.now()
+
+        def worker():
+            err = None
+            try:
+                core.put_event(cfg, ev, core.to_ics(ev, cfg.tzname, now))
+            except SystemExit as e:                 # el cliente avisa con SystemExit(mensaje)
+                err = str(e.code)
+            except Exception as e:                  # noqa: BLE001
+                err = str(e)
+            GLib.idle_add(self.on_saved, err)
+
+        threading.Thread(target=worker, daemon=True).start()
+
+    def on_saved(self, err):
+        if err:
+            self.busy = False
+            self.entry.set_editable(True)
+            self.entry.grab_focus()
+            self.show_status(f"✗ {err}", "error")
+        else:
+            self.show_status("✓ Guardado", "success")
+            GLib.timeout_add(650, self.dismiss)
+        return False
+
+
+class App(Adw.Application):
+    def __init__(self):
+        super().__init__(application_id="org.saywhen.Quick")
+        self.win = None
+
+    def do_activate(self):
+        if self.win is None:
+            self.win = QuickWindow(self, core.load_config(core.config_path()))
+        self.win.present()
+
+
+if __name__ == "__main__":
+    sys.exit(App().run(None))

@@ -1,0 +1,902 @@
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+"""
+saywhen — «sin formularios, sin campos: solo di cuándo».
+
+Escribe una frase en español o inglés y se convierte en un evento que se guarda
+en tu calendario de Radicale (CalDAV):
+
+    saywhen "Gimnasio todos los martes y viernes a las 9"
+    saywhen "Cine mañana a las 11 por hora y media"
+    saywhen "Dentista 3 de junio a las 12:30"
+    saywhen "Movie tomorrow at 11 for an hour and a half"
+
+Solo usa la biblioteca estándar (Python 3.9+). Si tienes `prompt_toolkit`
+instalado, el modo interactivo (sin argumentos) muestra la vista previa en vivo
+mientras escribes.
+
+Configuración: ~/.config/saywhen/config.ini  (créala con `saywhen --init`)
+"""
+from __future__ import annotations
+
+import argparse
+import base64
+import calendar
+import configparser
+import datetime as dt
+import getpass
+import os
+import re
+import ssl
+import subprocess
+import sys
+import unicodedata
+import urllib.error
+import urllib.request
+import uuid
+from dataclasses import dataclass, field
+from pathlib import Path
+from typing import Optional
+from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
+
+# ════════════════════════════════════════════════════════════════════════════
+#  Vocabulario
+# ════════════════════════════════════════════════════════════════════════════
+
+_ACCENTS = str.maketrans("áéíóúüñ", "aeiouun")
+
+
+def norm(text: str) -> str:
+    """Minúsculas y sin acentos, conservando la longitud (1 carácter → 1 carácter)."""
+    return "".join(c.lower()[:1] for c in text).translate(_ACCENTS)
+
+
+def _alt(words) -> str:
+    return "(?:" + "|".join(sorted(words, key=len, reverse=True)) + ")"
+
+
+_WD_BASE = {
+    "lunes": 0, "martes": 1, "miercoles": 2, "jueves": 3, "viernes": 4,
+    "sabado": 5, "domingo": 6,
+    "monday": 0, "tuesday": 1, "wednesday": 2, "thursday": 3, "friday": 4,
+    "saturday": 5, "sunday": 6,
+}
+WD = dict(_WD_BASE)
+WD.update({k + "s": v for k, v in _WD_BASE.items() if not k.endswith("s")})
+WD_ANY = _alt(WD)                    # con plurales (sábados, mondays…)
+WD_SING = _alt(_WD_BASE)
+WD_PL_EN = _alt([k + "s" for k in _WD_BASE if k.endswith("day")])
+
+MONTHS: dict[str, int] = {}
+for _i, _names in enumerate([
+    ("enero", "january", "ene", "jan"), ("febrero", "february", "feb"),
+    ("marzo", "march", "mar"), ("abril", "april", "abr", "apr"),
+    ("mayo", "may"), ("junio", "june", "jun"), ("julio", "july", "jul"),
+    ("agosto", "august", "ago", "aug"),
+    ("septiembre", "setiembre", "september", "sept", "sep"),
+    ("octubre", "october", "oct"), ("noviembre", "november", "nov"),
+    ("diciembre", "december", "dic", "dec"),
+], start=1):
+    for _n in _names:
+        MONTHS[_n] = _i
+MON = _alt(MONTHS)
+
+NUMW = {
+    "un": 1, "una": 1, "uno": 1, "one": 1, "an": 1, "dos": 2, "two": 2,
+    "tres": 3, "three": 3, "cuatro": 4, "four": 4, "cinco": 5, "five": 5,
+    "seis": 6, "six": 6, "siete": 7, "seven": 7, "ocho": 8, "eight": 8,
+    "nueve": 9, "nine": 9, "diez": 10, "ten": 10,
+}
+NUM = r"(?:\d+(?:[.,]\d+)?|" + "|".join(sorted(NUMW, key=len, reverse=True)) + r")"
+
+PART = r"(?:manana|tarde|noche|madrugada|morning|afternoon|evening|night)"
+
+DAY_NAMES = ["lunes", "martes", "miércoles", "jueves", "viernes", "sábado", "domingo"]
+DOW_SHORT = ["lun", "mar", "mié", "jue", "vie", "sáb", "dom"]
+MON_SHORT = ["ene", "feb", "mar", "abr", "may", "jun", "jul", "ago", "sep", "oct", "nov", "dic"]
+ICS_DAYS = ["MO", "TU", "WE", "TH", "FR", "SA", "SU"]
+
+STOP = {
+    "a", "al", "la", "las", "el", "los", "de", "del", "en", "para", "por",
+    "durante", "at", "on", "in", "for", "from", "to", "every", "each", "cada",
+    "todos", "todas", "y", "e", "and", "the", "@", "este", "this", "next",
+    "proximo", "sobre", "hacia", "entre", "between", "desde", "hasta", "until",
+}
+STOP_TRAIL = {"con", "with", "un", "una", "an"}
+
+
+class ParseError(Exception):
+    pass
+
+
+def num_val(s: str) -> float:
+    return float(NUMW[s]) if s in NUMW else float(s.replace(",", "."))
+
+
+# ════════════════════════════════════════════════════════════════════════════
+#  Expresiones regulares (se aplican sobre el texto en minúsculas y sin acentos)
+# ════════════════════════════════════════════════════════════════════════════
+
+_SEP = r"(?:\s*,\s*(?:y\s+|e\s+|and\s+)?|\s+(?:y|e|and)\s+|\s*&\s*)"
+
+# — Recurrencia —
+RE_WEEKDAYS = (r"(?<![a-z])(?:todos\s+los\s+dias\s+laborables|dias\s+laborables|"
+               r"de\s+lunes\s+a\s+viernes|every\s+weekday|on\s+weekdays|weekdays|entre\s+semana)(?![a-z])")
+RE_REC_WD = [
+    rf"(?<![a-z])(?:todos\s+los|todas\s+las|cada|every|each)\s+(?P<other>(?:otro|other)\s+)?"
+    rf"(?P<days>{WD_ANY}(?:{_SEP}{WD_ANY})*)(?![a-z])",
+    rf"(?<![a-z])los\s+(?P<days>{WD_ANY}(?:{_SEP}{WD_ANY})*)(?![a-z])",
+    rf"(?<![a-z])(?:on\s+)?(?P<days>{WD_PL_EN}(?:{_SEP}{WD_PL_EN})*)(?![a-z])",
+]
+RE_REC_UNIT = (
+    r"(?<![a-z])(?:(?:todos\s+los|todas\s+las|cada|every|each)\s+"
+    r"(?:(?P<n>\d+|dos|tres|cuatro|cinco|two|three|four|five|other|otro|otra)\s+)?"
+    r"(?P<unit>dias?|semanas?|meses|mes|anos?|days?|weeks?|months?|years?)"
+    r"|(?P<adv>diariamente|diario|semanalmente|semanal|mensualmente|mensual|"
+    r"anualmente|anual|daily|weekly|monthly|yearly|annually|everyday))(?![a-z])"
+)
+_UNIT_FREQ = {"dia": "DAILY", "day": "DAILY", "semana": "WEEKLY", "week": "WEEKLY",
+              "mes": "MONTHLY", "month": "MONTHLY", "ano": "YEARLY", "year": "YEARLY"}
+_ADV_FREQ = {"diariamente": "DAILY", "diario": "DAILY", "daily": "DAILY", "everyday": "DAILY",
+             "semanalmente": "WEEKLY", "semanal": "WEEKLY", "weekly": "WEEKLY",
+             "mensualmente": "MONTHLY", "mensual": "MONTHLY", "monthly": "MONTHLY",
+             "anualmente": "YEARLY", "anual": "YEARLY", "yearly": "YEARLY", "annually": "YEARLY"}
+
+
+# — Duración —
+def _dur_re(prefixed: bool) -> str:
+    hu = r"(?:horas?|hours?|hrs?" + ("|h" if prefixed else "") + r")(?![a-z])"
+    mu = r"(?:minutos?|minutes?|mins?" + ("|m" if prefixed else "") + r")(?![a-z])"
+    body = (
+        r"(?P<half>media\s+hora|half\s+an?\s+hour|half[- ]hour)"
+        rf"|(?P<h>{NUM})\s*{hu}(?:\s*(?:y\s+media|and\s+a\s+half)(?P<hh>)"
+        rf"|\s*(?:y|and)?\s*(?P<hm>\d{{1,2}})\s*{mu}|(?<=h)(?P<hg>\d{{2}})(?!\d))?"
+        rf"|(?P<m>{NUM})\s*{mu}"
+    )
+    pre = r"(?:por|durante|for|lasting)\s+(?:(?:unos|about|aprox\.?)\s+)?" if prefixed else ""
+    return rf"(?<![a-z0-9]){pre}(?:{body})"
+
+
+RE_DUR_PREFIXED = _dur_re(True)
+RE_DUR_BARE = _dur_re(False)
+
+# — Hora —
+_T = r"(?P<{h}>\d{{1,2}})(?::(?P<{m}>\d{{2}}))?(?:\s*(?P<{a}>am|pm))?"
+RE_T_RANGE = (
+    r"(?<![a-z0-9:.])(?:(?P<pre>de|from|entre|between|a\s+las?|at)\s+)?(?:las?\s+)?"
+    + _T.format(h="h1", m="m1", a="a1")
+    + r"\s*(?P<conn>-|–|—|a|al|hasta|to|until|y|and)\s*(?:las?\s+)?"
+    + _T.format(h="h2", m="m2", a="a2") + r"(?![\d:])"
+)
+_HSUF = r"(?:\s*(?:h|hs|hrs|horas?)(?![a-z]))?"
+_PARTSUF = rf"(?:\s+(?:de\s+la|por\s+la|in\s+the)\s+(?P<part>{PART})(?![a-z]))?"
+RE_T1 = (r"(?<![a-z0-9])(?:a\s+las?|a\s+eso\s+de|at|@|around|about|sobre\s+las?|hacia\s+las?)\s*"
+         r"(?P<h>\d{1,2})(?:[:.h](?P<m>\d{2}))?(?:\s*(?P<a>am|pm))?" + _HSUF + _PARTSUF)
+RE_T2 = (r"(?<![a-z0-9:.])(?P<h>\d{1,2}):(?P<m>\d{2})(?:\s*(?P<a>am|pm))?(?![a-z0-9:])" + _HSUF + _PARTSUF)
+RE_T3 = r"(?<![a-z0-9:.])(?P<h>\d{1,2})\s*(?P<a>am|pm)(?![a-z])"
+RE_T4 = r"(?<![a-z])(?P<w>mediodia|midday|noon|medianoche|midnight)(?![a-z])"
+
+# — Fecha —
+RE_ISO = r"(?<![\d/.-])(?P<y>\d{4})-(?P<mo>\d{1,2})-(?P<d>\d{1,2})(?!\d)"
+RE_D1 = (rf"(?<![a-z0-9])(?:(?:el|on|the|este)\s+)?(?:dia\s+)?(?P<d>\d{{1,2}})(?:st|nd|rd|th|ro|o)?\s+"
+         rf"(?:de\s+|of\s+)?(?P<mon>{MON})\.?(?![a-z])(?:\s+(?:del?\s+|,\s*)?(?P<y>\d{{4}}))?")
+RE_D2 = (rf"(?<![a-z0-9])(?P<mon>{MON})\.?\s+(?:the\s+)?(?P<d>\d{{1,2}})(?:st|nd|rd|th)?(?![\d:a-z])"
+         rf"(?:,?\s+(?P<y>\d{{4}}))?")
+RE_NUM_Y4 = r"(?<![\d/.:-])(?P<a>\d{1,2})-(?P<b>\d{1,2})-(?P<y>\d{4})(?![\d:])"
+RE_NUM = r"(?<![\d/.:-])(?P<a>\d{1,2})[/.](?P<b>\d{1,2})(?:[/.](?P<y>\d{4}|\d{2}))?(?![\d:])"
+RE_AFTER_TOMORROW = r"(?<![a-z])(?:pasado\s+manana|day\s+after\s+tomorrow)(?![a-z])"
+RE_TOMORROW = r"(?<![a-z])(?:manana|tomorrow)(?![a-z])"
+RE_TODAY = r"(?<![a-z])(?:hoy|today|tonight|esta\s+noche|esta\s+tarde|this\s+evening)(?![a-z])"
+RE_IN_N = (rf"(?<![a-z])(?:en|dentro\s+de|in)\s+(?P<n>{NUM})\s+"
+           r"(?P<u>dias?|semanas?|meses|mes|days?|weeks?|months?)(?![a-z])")
+RE_NEXT_WEEK = r"(?<![a-z])(?:la\s+)?(?:proxima\s+semana|semana\s+que\s+viene|next\s+week)(?![a-z])"
+RE_WEEKDAY = (rf"(?<![a-z])(?P<pre>(?:(?:el|on|the|este|this)\s+)?(?:(?:proximo|next)\s+)?)"
+              rf"(?P<wd>{WD_SING})(?![a-z])")
+
+
+# ════════════════════════════════════════════════════════════════════════════
+#  Parser
+# ════════════════════════════════════════════════════════════════════════════
+
+@dataclass
+class Event:
+    title: str
+    start: object          # datetime o date
+    end: object
+    all_day: bool
+    rrule: Optional[str] = None
+    recur_text: Optional[str] = None
+    uid: str = field(default_factory=lambda: f"{uuid.uuid4()}@saywhen")
+
+
+class Scratch:
+    """Texto de trabajo: cada coincidencia se 'consume' y lo que sobra es el título."""
+
+    def __init__(self, text: str):
+        self.orig = text
+        self.s = norm(text)
+        self.removed = [False] * len(text)
+
+    def take(self, pattern: str, check=None):
+        for m in re.finditer(pattern, self.s):
+            if check is not None and not check(m):
+                continue
+            a, b = m.span()
+            self.s = self.s[:a] + " " * (b - a) + self.s[b:]
+            for i in range(a, b):
+                self.removed[i] = True
+            return m
+        return None
+
+    def title(self) -> str:
+        chars = [" " if r else c for c, r in zip(self.orig, self.removed)]
+        words = "".join(chars).split()
+
+        def junk(w, trailing):
+            k = norm(w).strip(",.;:-–—()[]\"'")
+            return k == "" or k in STOP or (trailing and k in STOP_TRAIL)
+
+        while words and junk(words[0], False):
+            words.pop(0)
+        while words and junk(words[-1], True):
+            words.pop()
+        t = " ".join(words).strip(" ,;:-–—")
+        return (t[0].upper() + t[1:]) if t else ""
+
+
+def add_months(d: dt.date, n: int) -> dt.date:
+    y, m = divmod(d.month - 1 + n, 12)
+    y += d.year
+    m += 1
+    return d.replace(year=y, month=m, day=min(d.day, calendar.monthrange(y, m)[1]))
+
+
+def mk_date(y, mo: int, d: int, today: dt.date) -> Optional[dt.date]:
+    try:
+        if y is None:
+            c = dt.date(today.year, mo, d)
+            return c if c >= today else dt.date(today.year + 1, mo, d)
+        y = int(y)
+        return dt.date(y + 2000 if y < 100 else y, mo, d)
+    except ValueError:
+        return None
+
+
+def to_hm(h, m, ap, part, pm_guess) -> Optional[tuple]:
+    h = int(h)
+    m = int(m or 0)
+    if m > 59:
+        return None
+    if ap:
+        if not 1 <= h <= 12:
+            return None
+        return (h % 12 + (12 if ap == "pm" else 0), m)
+    if h > 23:
+        return None
+    if part in ("noche", "night"):
+        h = 0 if h == 12 else (h + 12 if 6 <= h < 12 else h)
+    elif part in ("tarde", "afternoon", "evening"):
+        h = h + 12 if h < 12 else h
+    elif part == "madrugada":
+        h = 0 if h == 12 else h
+    elif part is None and pm_guess and 1 <= h <= 6:
+        h += 12            # «a las 5» → 17:00 (heurística)
+    return (h, m)
+
+
+def find_recurrence(sc: Scratch):
+    """→ (freq, interval, [weekdays]) o None."""
+    if sc.take(RE_WEEKDAYS):
+        return ("WEEKLY", 1, [0, 1, 2, 3, 4])
+    for rx in RE_REC_WD:
+        m = sc.take(rx)
+        if m:
+            days = sorted({WD[w] for w in re.findall(WD_ANY, m.group("days"))})
+            interval = 2 if "other" in m.groupdict() and m.group("other") else 1
+            return ("WEEKLY", interval, days)
+    m = sc.take(RE_REC_UNIT)
+    if m:
+        if m.group("adv"):
+            return (_ADV_FREQ[m.group("adv")], 1, [])
+        n = m.group("n")
+        interval = 1
+        if n:
+            interval = 2 if n in ("other", "otro", "otra") else int(n) if n.isdigit() else int(NUMW.get(n, 1))
+        unit = m.group("unit").rstrip("s") if m.group("unit") != "meses" else "mes"
+        return (_UNIT_FREQ[unit], max(1, interval), [])
+    return None
+
+
+def find_duration(sc: Scratch, prefixed: bool) -> Optional[int]:
+    def mins(m):
+        if m.group("half"):
+            return 30
+        if m.group("h"):
+            t = num_val(m.group("h")) * 60
+            if m.group("hh") is not None:
+                t += 30
+            elif m.group("hm"):
+                t += int(m.group("hm"))
+            elif m.group("hg"):
+                t += int(m.group("hg"))
+            return round(t)
+        return round(num_val(m.group("m")))
+
+    res = []
+
+    def chk(m):
+        v = mins(m)
+        if v > 0:
+            res.append(v)
+            return True
+        return False
+
+    m = sc.take(RE_DUR_PREFIXED if prefixed else RE_DUR_BARE, chk)
+    return res[0] if m else None
+
+
+def find_time(sc: Scratch, pm_guess: bool):
+    """→ ((h, m), (h, m) | None) o None."""
+    res: list = []
+
+    def chk_range(m):
+        has_colon = bool(m.group("m1") or m.group("m2"))
+        has_ap = bool(m.group("a1") or m.group("a2"))
+        pre, conn = m.group("pre"), m.group("conn")
+        if conn in ("y", "and") and pre not in ("entre", "between"):
+            return False
+        if not (pre or (has_colon or has_ap)):
+            return False
+        if not pre and not ((m.group("m1") or m.group("a1")) and (m.group("m2") or m.group("a2"))):
+            return False
+        a1, a2 = m.group("a1"), m.group("a2")
+        if a2 and not a1:
+            a1 = a2 if int(m.group("h1")) <= int(m.group("h2")) else ("am" if a2 == "pm" else "pm")
+        s = to_hm(m.group("h1"), m.group("m1"), a1, None, pm_guess)
+        e = to_hm(m.group("h2"), m.group("m2"), a2, None, pm_guess)
+        if s is None or e is None:
+            return False
+        res.append((s, e))
+        return True
+
+    if sc.take(RE_T_RANGE, chk_range):
+        return res[0]
+
+    for rx in (RE_T1, RE_T2, RE_T3):
+        res = []
+
+        def chk(m):
+            g = m.groupdict()
+            v = to_hm(g["h"], g.get("m"), g.get("a"), g.get("part"), pm_guess)
+            if v is None:
+                return False
+            res.append(v)
+            return True
+
+        if sc.take(rx, chk):
+            return (res[0], None)
+
+    m = sc.take(RE_T4)
+    if m:
+        return (((0, 0) if m.group("w") in ("medianoche", "midnight") else (12, 0)), None)
+    return None
+
+
+def find_date(sc: Scratch, today: dt.date, order: str):
+    """→ ('date', d) | ('weekday', wd, strict_next) | None"""
+    res: list = []
+
+    def attempt(rx, build):
+        res.clear()
+
+        def chk(m):
+            d = build(m)
+            if d is None:
+                return False
+            res.append(d)
+            return True
+
+        return sc.take(rx, chk)
+
+    if attempt(RE_ISO, lambda m: mk_date(m["y"], int(m["mo"]), int(m["d"]), today)):
+        return ("date", res[0])
+    if attempt(RE_D1, lambda m: mk_date(m["y"], MONTHS[m["mon"]], int(m["d"]), today)):
+        return ("date", res[0])
+    if attempt(RE_D2, lambda m: mk_date(m["y"], MONTHS[m["mon"]], int(m["d"]), today)):
+        return ("date", res[0])
+    if attempt(RE_NUM_Y4, lambda m: mk_date(m["y"], *((int(m["b"]), int(m["a"])) if order == "dmy"
+                                                       else (int(m["a"]), int(m["b"]))), today)):
+        return ("date", res[0])
+    if attempt(RE_NUM, lambda m: mk_date(m["y"], *((int(m["b"]), int(m["a"])) if order == "dmy"
+                                                    else (int(m["a"]), int(m["b"]))), today)):
+        return ("date", res[0])
+
+    if sc.take(RE_AFTER_TOMORROW):
+        return ("date", today + dt.timedelta(days=2))
+    if sc.take(RE_TOMORROW):
+        return ("date", today + dt.timedelta(days=1))
+    if sc.take(RE_TODAY):
+        return ("date", today)
+    m = sc.take(RE_IN_N)
+    if m:
+        n = int(num_val(m.group("n")))
+        u = m.group("u")
+        if u.startswith(("dia", "day")):
+            return ("date", today + dt.timedelta(days=n))
+        if u.startswith(("sem", "week")):
+            return ("date", today + dt.timedelta(weeks=n))
+        return ("date", add_months(today, n))
+    if sc.take(RE_NEXT_WEEK):
+        return ("date", today + dt.timedelta(days=7))
+    m = sc.take(RE_WEEKDAY)
+    if m:
+        strict = bool(re.search(r"proximo|next", m.group("pre")))
+        return ("weekday", WD[m.group("wd")], strict)
+    return None
+
+
+def parse(text: str, now: dt.datetime, date_order: str = "dmy",
+          default_minutes: int = 60, pm_guess: bool = True) -> Event:
+    text = unicodedata.normalize("NFC", text).strip()
+    if not text:
+        raise ParseError("frase vacía")
+    sc = Scratch(text)
+    today = now.date()
+    tz = now.tzinfo
+
+    rec = find_recurrence(sc)
+    dur = find_duration(sc, prefixed=True)
+    tm = find_time(sc, pm_guess)
+    if dur is None:
+        dur = find_duration(sc, prefixed=False)
+    when = find_date(sc, today, date_order)
+    if when is None or when[0] == "date":      # quita «el martes» aunque ya haya fecha explícita
+        pass
+    if when and when[0] == "date":
+        sc.take(RE_WEEKDAY)
+
+    def passed(d: dt.date, hm) -> bool:
+        return dt.datetime.combine(d, dt.time(*hm), tz) <= now
+
+    start_hm = tm[0] if tm else None
+    byday = rec[2] if rec else []
+
+    if when is None:
+        if rec:
+            d = today + dt.timedelta(days=1) if (start_hm and passed(today, start_hm)) else today
+            while byday and d.weekday() not in byday:
+                d += dt.timedelta(days=1)
+        elif start_hm:
+            d = today + dt.timedelta(days=1) if passed(today, start_hm) else today
+        else:
+            raise ParseError("no encontré fecha ni hora")
+    elif when[0] == "weekday":
+        delta = (when[1] - today.weekday()) % 7
+        if delta == 0 and (when[2] or (start_hm and passed(today, start_hm))):
+            delta = 7
+        d = today + dt.timedelta(days=delta)
+    else:
+        d = when[1]
+        while byday and d.weekday() not in byday:
+            d += dt.timedelta(days=1)
+
+    title = sc.title() or "Evento"
+
+    rrule = recur_text = None
+    if rec:
+        freq, interval, days = rec
+        parts = [f"FREQ={freq}"]
+        if interval > 1:
+            parts.append(f"INTERVAL={interval}")
+        if days:
+            parts.append("BYDAY=" + ",".join(ICS_DAYS[x] for x in days))
+        rrule = ";".join(parts)
+        recur_text = recur_description(freq, interval, days)
+
+    if start_hm is None:
+        return Event(title, d, d + dt.timedelta(days=1), True, rrule, recur_text)
+
+    start = dt.datetime.combine(d, dt.time(*start_hm), tz)
+    if tm[1] is not None:
+        end = dt.datetime.combine(d, dt.time(*tm[1]), tz)
+        if end <= start:
+            end = end + dt.timedelta(hours=12) if tm[1][0] < 12 and (end + dt.timedelta(hours=12)) > start \
+                else end + dt.timedelta(days=1)
+    else:
+        end = start + dt.timedelta(minutes=dur or default_minutes)
+    return Event(title, start, end, False, rrule, recur_text)
+
+
+def recur_description(freq: str, interval: int, days: list) -> str:
+    if freq == "WEEKLY" and days:
+        if days == [0, 1, 2, 3, 4]:
+            base = "de lunes a viernes"
+        else:
+            names = [DAY_NAMES[x] for x in days]
+            base = "cada " + (names[0] if len(names) == 1 else ", ".join(names[:-1]) + " y " + names[-1])
+        return base + (f" (cada {interval} semanas)" if interval > 1 else "")
+    one, plural = {"DAILY": ("todos los días", "días"), "WEEKLY": ("cada semana", "semanas"),
+                   "MONTHLY": ("cada mes", "meses"), "YEARLY": ("cada año", "años")}[freq]
+    return one if interval == 1 else f"cada {interval} {plural}"
+
+
+# ════════════════════════════════════════════════════════════════════════════
+#  iCalendar
+# ════════════════════════════════════════════════════════════════════════════
+
+def _esc(t: str) -> str:
+    return t.replace("\\", "\\\\").replace(";", "\\;").replace(",", "\\,").replace("\n", "\\n")
+
+
+def _fold(line: str) -> str:
+    if len(line.encode()) <= 75:
+        return line
+    out, cur = [], ""
+    for ch in line:
+        limit = 75 if not out else 74
+        if len((cur + ch).encode()) > limit:
+            out.append(cur)
+            cur = ch
+        else:
+            cur += ch
+    out.append(cur)
+    return "\r\n ".join(out)
+
+
+def to_ics(ev: Event, tzname: str, now: dt.datetime) -> str:
+    utc = dt.timezone.utc
+    f_local = "%Y%m%dT%H%M%S"
+    L = ["BEGIN:VCALENDAR", "VERSION:2.0", "PRODID:-//saywhen-cli//ES", "CALSCALE:GREGORIAN",
+         "BEGIN:VEVENT", f"UID:{ev.uid}", "DTSTAMP:" + now.astimezone(utc).strftime("%Y%m%dT%H%M%SZ")]
+    if ev.all_day:
+        L += [f"DTSTART;VALUE=DATE:{ev.start:%Y%m%d}", f"DTEND;VALUE=DATE:{ev.end:%Y%m%d}"]
+    elif ev.rrule:      # recurrente: hora local con TZID para respetar el horario de verano
+        L += [f"DTSTART;TZID={tzname}:{ev.start.strftime(f_local)}",
+              f"DTEND;TZID={tzname}:{ev.end.strftime(f_local)}"]
+    else:
+        L += ["DTSTART:" + ev.start.astimezone(utc).strftime("%Y%m%dT%H%M%SZ"),
+              "DTEND:" + ev.end.astimezone(utc).strftime("%Y%m%dT%H%M%SZ")]
+    if ev.rrule:
+        L.append(f"RRULE:{ev.rrule}")
+    L += [f"SUMMARY:{_esc(ev.title)}", "END:VEVENT", "END:VCALENDAR"]
+    return "\r\n".join(_fold(x) for x in L) + "\r\n"
+
+
+# ════════════════════════════════════════════════════════════════════════════
+#  Presentación
+# ════════════════════════════════════════════════════════════════════════════
+
+def _fmt_day(d) -> str:
+    return f"{DOW_SHORT[d.weekday()]} {d.day} {MON_SHORT[d.month - 1]} {d.year}"
+
+
+def when_text(ev: Event) -> str:
+    if ev.all_day:
+        return f"{_fmt_day(ev.start)} (todo el día)"
+    if ev.start.date() == ev.end.date():
+        return f"{_fmt_day(ev.start)}, {ev.start:%H:%M}–{ev.end:%H:%M}"
+    return f"{_fmt_day(ev.start)} {ev.start:%H:%M} → {_fmt_day(ev.end)} {ev.end:%H:%M}"
+
+
+def one_line(ev: Event) -> str:
+    s = f"{ev.title} · {when_text(ev)}"
+    return s + (f" · {ev.recur_text}" if ev.recur_text else "")
+
+
+def preview(ev: Event, cfg: "Config") -> str:
+    rows = [("Título", ev.title), ("Cuándo", when_text(ev))]
+    if ev.recur_text:
+        rows.append(("Repite", ev.recur_text))
+    if cfg.url:
+        rows.append(("Calendario", cfg.url))
+    return "\n".join(f"  {k + ':':<12}{v}" for k, v in rows)
+
+
+# ════════════════════════════════════════════════════════════════════════════
+#  Configuración
+# ════════════════════════════════════════════════════════════════════════════
+
+def config_path(override: Optional[str] = None) -> Path:
+    if override:
+        return Path(override).expanduser()
+    base = os.environ.get("XDG_CONFIG_HOME") or str(Path.home() / ".config")
+    return Path(base) / "saywhen" / "config.ini"
+
+
+def detect_tz(name: Optional[str] = None) -> str:
+    cands = [name, os.environ.get("TZ")]
+    try:
+        link = os.path.realpath("/etc/localtime")
+        if "/zoneinfo/" in link:
+            cands.append(link.split("/zoneinfo/", 1)[1])
+    except OSError:
+        pass
+    try:
+        cands.append(Path("/etc/timezone").read_text().strip())
+    except OSError:
+        pass
+    for c in cands:
+        if c:
+            try:
+                ZoneInfo(c.lstrip(":"))
+                return c.lstrip(":")
+            except (ZoneInfoNotFoundError, ValueError):
+                continue
+    return "UTC"
+
+
+@dataclass
+class Config:
+    url: str = ""
+    username: str = ""
+    password: str = ""
+    password_cmd: str = ""
+    tzname: str = "UTC"
+    verify_tls: bool = True
+    date_order: str = "dmy"
+    default_minutes: int = 60
+    pm_guess: bool = True
+
+    @property
+    def tz(self) -> ZoneInfo:
+        return ZoneInfo(self.tzname)
+
+    def now(self) -> dt.datetime:
+        return dt.datetime.now(self.tz)
+
+    def get_password(self) -> str:
+        if os.environ.get("SAYWHEN_PASSWORD"):
+            return os.environ["SAYWHEN_PASSWORD"]
+        if self.password_cmd:
+            r = subprocess.run(self.password_cmd, shell=True, capture_output=True, text=True)
+            if r.returncode != 0:
+                raise SystemExit(f"password_cmd falló: {r.stderr.strip() or r.returncode}")
+            return r.stdout.strip().split("\n")[0]
+        return self.password
+
+
+def load_config(path: Path) -> Config:
+    cp = configparser.ConfigParser()
+    if path.exists():
+        cp.read(path, encoding="utf-8")
+    g = cp["radicale"] if cp.has_section("radicale") else {}
+    cfg = Config(
+        url=g.get("url", ""), username=g.get("username", ""), password=g.get("password", ""),
+        password_cmd=g.get("password_cmd", ""), tzname=detect_tz(g.get("timezone") or None),
+        verify_tls=str(g.get("verify_tls", "true")).lower() not in ("0", "false", "no"),
+        date_order=g.get("date_order", "dmy").lower(),
+        default_minutes=int(g.get("default_duration", 60)),
+        pm_guess=str(g.get("pm_guess", "true")).lower() not in ("0", "false", "no"),
+    )
+    cfg.url = os.environ.get("SAYWHEN_URL", cfg.url)
+    cfg.username = os.environ.get("SAYWHEN_USER", cfg.username)
+    if cfg.url and not cfg.url.endswith("/"):
+        cfg.url += "/"
+    return cfg
+
+
+# ════════════════════════════════════════════════════════════════════════════
+#  CalDAV (Radicale)
+# ════════════════════════════════════════════════════════════════════════════
+
+def _request(cfg: Config, method: str, url: str, body: Optional[bytes] = None, headers=None):
+    token = base64.b64encode(f"{cfg.username}:{cfg.get_password()}".encode()).decode()
+    req = urllib.request.Request(url, data=body, method=method)
+    req.add_header("Authorization", f"Basic {token}")
+    for k, v in (headers or {}).items():
+        req.add_header(k, v)
+    ctx = ssl.create_default_context()
+    if not cfg.verify_tls:
+        ctx.check_hostname = False
+        ctx.verify_mode = ssl.CERT_NONE
+    return urllib.request.urlopen(req, timeout=15, context=ctx)
+
+
+def _need_server(cfg: Config):
+    if not cfg.url:
+        raise SystemExit("Falta la URL del calendario. Ejecuta `saywhen --init` o define SAYWHEN_URL.")
+
+
+def _explain_http(e: urllib.error.HTTPError) -> str:
+    hints = {401: "usuario o contraseña incorrectos", 403: "ese usuario no tiene permiso sobre este calendario",
+             404: "la URL del calendario no existe (revisa usuario y nombre de la colección)",
+             409: "la colección no existe (¿URL mal escrita o calendario sin crear?)",
+             412: "ya existe un evento con ese UID", 405: "la URL no parece una colección de calendario"}
+    return f"HTTP {e.code} — {hints.get(e.code, e.reason)}"
+
+
+def put_event(cfg: Config, ev: Event, ics: str):
+    _need_server(cfg)
+    try:
+        with _request(cfg, "PUT", f"{cfg.url}{ev.uid.split('@')[0]}.ics", ics.encode("utf-8"),
+                      {"Content-Type": "text/calendar; charset=utf-8", "If-None-Match": "*"}) as r:
+            return r.status
+    except urllib.error.HTTPError as e:
+        raise SystemExit(f"Radicale rechazó el evento: {_explain_http(e)}")
+    except (urllib.error.URLError, OSError) as e:
+        raise SystemExit(f"No se pudo conectar con {cfg.url}: {getattr(e, 'reason', e)}")
+
+
+def check_connection(cfg: Config) -> bool:
+    _need_server(cfg)
+    body = (b'<?xml version="1.0"?><propfind xmlns="DAV:"><prop><resourcetype/></prop></propfind>')
+    try:
+        with _request(cfg, "PROPFIND", cfg.url, body,
+                      {"Depth": "0", "Content-Type": "application/xml"}) as r:
+            text = r.read().decode("utf-8", "replace").lower()
+    except urllib.error.HTTPError as e:
+        print(f"✗ {_explain_http(e)}")
+        return False
+    except (urllib.error.URLError, OSError) as e:
+        print(f"✗ No se pudo conectar: {getattr(e, 'reason', e)}")
+        return False
+    if "calendar" in text:
+        print("✓ Conexión correcta: es una colección de calendario.")
+        return True
+    print("! El servidor responde, pero esa URL no parece una colección de calendario.")
+    return False
+
+
+def run_init(path: Path) -> Config:
+    print(f"Configuración → {path}\n")
+    print("La URL es la de la colección de calendario, p. ej. https://radicale.ejemplo.com/usuario/calendario/")
+    url = input("URL del calendario: ").strip()
+    user = input("Usuario: ").strip()
+    pw = getpass.getpass("Contraseña (vacío = no guardarla; usa password_cmd o SAYWHEN_PASSWORD): ")
+    tz = input(f"Zona horaria [{detect_tz()}]: ").strip() or detect_tz()
+    lines = ["[radicale]", f"url = {url}", f"username = {user}"]
+    lines.append(f"password = {pw}" if pw else "# password_cmd = pass show radicale")
+    lines += [f"timezone = {tz}", "# verify_tls = true", "# date_order = dmy   ; o mdy",
+              "# default_duration = 60", "# pm_guess = true    ; «a las 5» → 17:00"]
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text("\n".join(lines) + "\n", encoding="utf-8")
+    path.chmod(0o600)
+    print("Guardado.\n")
+    cfg = load_config(path)
+    if not pw and not cfg.password_cmd:
+        cfg.password = getpass.getpass("Contraseña para probar la conexión: ")
+        os.environ["SAYWHEN_PASSWORD"] = cfg.password
+    check_connection(cfg)
+    return cfg
+
+
+# ════════════════════════════════════════════════════════════════════════════
+#  CLI
+# ════════════════════════════════════════════════════════════════════════════
+
+def ask_phrase(cfg: Config) -> str:
+    try:
+        from prompt_toolkit import PromptSession
+    except ImportError:
+        return input("¿Cuándo? > ")
+    session = PromptSession()
+
+    def toolbar():
+        t = session.default_buffer.text
+        if not t.strip():
+            return " Ej.: Gimnasio todos los martes y viernes a las 9"
+        try:
+            return " " + one_line(parse(t, cfg.now(), cfg.date_order, cfg.default_minutes, cfg.pm_guess))
+        except ParseError as e:
+            return f" ⚠ {e}"
+
+    return session.prompt("¿Cuándo? > ", bottom_toolbar=toolbar)
+
+
+def selftest() -> int:
+    tz = ZoneInfo("Europe/Madrid")
+    now = dt.datetime(2026, 11, 12, 10, 0, tzinfo=tz)      # jueves
+
+    def summ(e: Event) -> str:
+        if e.all_day:
+            return f"{e.title}|{e.start}|allday|{e.rrule}"
+        return f"{e.title}|{e.start:%Y-%m-%d %H:%M}|{e.end:%H:%M}|{e.rrule}"
+
+    cases = [
+        ("Gym todos los martes y viernes a las 9", "Gym|2026-11-13 09:00|10:00|FREQ=WEEKLY;BYDAY=TU,FR"),
+        ("Movie tomorrow at 11 for an hour and a half", "Movie|2026-11-13 11:00|12:30|None"),
+        ("Cine mañana a las 11 una hora y media", "Cine|2026-11-13 11:00|12:30|None"),
+        ("Dentist june 3 at 12:30", "Dentist|2027-06-03 12:30|13:30|None"),
+        ("Dentista 3 de junio a las 12:30", "Dentista|2027-06-03 12:30|13:30|None"),
+        ("Cena con Ana el viernes a las 9 de la noche", "Cena con Ana|2026-11-13 21:00|22:00|None"),
+        ("Reunión de 3 a 5 el lunes", "Reunión|2026-11-16 15:00|17:00|None"),
+        ("Médico 15/12 10:30", "Médico|2026-12-15 10:30|11:30|None"),
+        ("Revisión cada 2 semanas el lunes a las 10", "Revisión|2026-11-16 10:00|11:00|FREQ=WEEKLY;INTERVAL=2"),
+        ("Vitaminas todos los días a las 8", "Vitaminas|2026-11-13 08:00|09:00|FREQ=DAILY"),
+        ("Cumpleaños de Marta 3 de mayo", "Cumpleaños de Marta|2027-05-03|allday|None"),
+        ("Llamar a mamá hoy a las 18:30", "Llamar a mamá|2026-11-12 18:30|19:30|None"),
+        ("Call Bob in 2 days at 3pm", "Call Bob|2026-11-14 15:00|16:00|None"),
+        ("Yoga 7pm every weekday", "Yoga|2026-11-12 19:00|20:00|FREQ=WEEKLY;BYDAY=MO,TU,WE,TH,FR"),
+        ("Dentista 2026-12-01 a las 16", "Dentista|2026-12-01 16:00|17:00|None"),
+        ("Examen el próximo martes de 9 a 11", "Examen|2026-11-17 09:00|11:00|None"),
+        ("Concierto 20 de diciembre a las 21:00 por 3 horas", "Concierto|2026-12-20 21:00|00:00|None"),
+        ("Lunch at 1", "Lunch|2026-11-12 13:00|14:00|None"),
+        ("Reunión a las 9 de la mañana", "Reunión|2026-11-13 09:00|10:00|None"),
+        ("Clase los lunes y miércoles a las 18", "Clase|2026-11-16 18:00|19:00|FREQ=WEEKLY;BYDAY=MO,WE"),
+        ("Gimnasio mañana por 45 min a las 7", "Gimnasio|2026-11-13 07:00|07:45|None"),
+        ("Standup every monday at 9:15am for 15 minutes", "Standup|2026-11-16 09:15|09:30|FREQ=WEEKLY;BYDAY=MO"),
+    ]
+    bad = 0
+    for phrase, want in cases:
+        try:
+            got = summ(parse(phrase, now))
+        except ParseError as e:
+            got = f"ERROR {e}"
+        ok = got == want
+        bad += not ok
+        print(("✓ " if ok else "✗ ") + phrase + ("" if ok else f"\n    esperado: {want}\n    obtenido: {got}"))
+    try:
+        parse("hola qué tal", now)
+        print("✗ «hola qué tal» debería fallar")
+        bad += 1
+    except ParseError:
+        print("✓ «hola qué tal» → error")
+    print(f"\n{'Todo OK' if not bad else str(bad) + ' fallo(s)'}")
+    return 1 if bad else 0
+
+
+def main(argv=None) -> int:
+    ap = argparse.ArgumentParser(prog="saywhen", description="Una frase → evento en tu Radicale.")
+    ap.add_argument("phrase", nargs="*", help="p. ej.: Dentista 3 de junio a las 12:30")
+    ap.add_argument("-y", "--yes", action="store_true", help="no pedir confirmación")
+    ap.add_argument("-n", "--dry-run", action="store_true", help="solo mostrar lo que entendió")
+    ap.add_argument("--ics", action="store_true", help="imprimir el .ics generado")
+    ap.add_argument("--init", action="store_true", help="crear/actualizar la configuración")
+    ap.add_argument("--check", action="store_true", help="probar la conexión con Radicale")
+    ap.add_argument("--config", help="ruta alternativa del config.ini")
+    ap.add_argument("--selftest", action="store_true", help="ejecutar pruebas del parser")
+    args = ap.parse_args(argv)
+
+    if args.selftest:
+        return selftest()
+
+    path = config_path(args.config)
+    if args.init:
+        run_init(path)
+        return 0
+    cfg = load_config(path)
+    if args.check:
+        return 0 if check_connection(cfg) else 1
+
+    try:
+        if args.phrase:
+            phrase = " ".join(args.phrase)
+        elif not sys.stdin.isatty():
+            phrase = sys.stdin.read()
+        else:
+            phrase = ask_phrase(cfg)
+    except (KeyboardInterrupt, EOFError):
+        print()
+        return 130
+
+    now = cfg.now()
+    try:
+        ev = parse(phrase, now, cfg.date_order, cfg.default_minutes, cfg.pm_guess)
+    except ParseError as e:
+        print(f"No pude entender la frase: {e}", file=sys.stderr)
+        return 2
+
+    print(preview(ev, cfg))
+    ics = to_ics(ev, cfg.tzname, now)
+    if args.ics:
+        print("\n" + ics.replace("\r\n", "\n"))
+    if args.dry_run:
+        return 0
+
+    _need_server(cfg)
+    if not args.yes:
+        try:
+            ans = input("\n¿Guardar? [S/n] ").strip().lower()
+        except (KeyboardInterrupt, EOFError):
+            print()
+            return 130
+        if ans not in ("", "s", "si", "sí", "y", "yes"):
+            print("Cancelado.")
+            return 1
+    put_event(cfg, ev, ics)
+    print("✓ Evento guardado en Radicale.")
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())
