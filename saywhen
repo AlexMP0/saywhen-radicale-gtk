@@ -894,7 +894,7 @@ def main(argv=None) -> int:
             print("Cancelado.")
             return 1
     put_event(cfg, ev, ics)
-    print("✓ Evento guardado en Radicale.")
+    print("[■w■]✓ Evento guardado en Radicale.")
     return 0
 
 
