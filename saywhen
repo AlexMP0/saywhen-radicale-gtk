@@ -768,7 +768,7 @@ def ask_phrase(cfg: Config) -> str:
     try:
         from prompt_toolkit import PromptSession
     except ImportError:
-        return input("¿Cuándo? > ")
+        return input("[⌐■w■] > ")
     session = PromptSession()
 
     def toolbar():
@@ -780,7 +780,7 @@ def ask_phrase(cfg: Config) -> str:
         except ParseError as e:
             return f" ⚠ {e}"
 
-    return session.prompt("¿Cuándo? > ", bottom_toolbar=toolbar)
+    return session.prompt("[⌐■w■] > ", bottom_toolbar=toolbar)
 
 
 def selftest() -> int:
