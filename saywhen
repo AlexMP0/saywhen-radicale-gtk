@@ -27,6 +27,7 @@ import datetime as dt
 import getpass
 import os
 import re
+import shutil
 import ssl
 import subprocess
 import sys
@@ -625,6 +626,61 @@ def detect_tz(name: Optional[str] = None) -> str:
     return "UTC"
 
 
+# ── Llavero del sistema (libsecret, vía `secret-tool`) ─────────────────────
+KEYRING_APP = "saywhen"
+
+
+def _secret_tool() -> Optional[str]:
+    return shutil.which("secret-tool")
+
+
+def keyring_lookup(url: str, user: str) -> Optional[str]:
+    exe = _secret_tool()
+    if not exe:
+        return None
+    try:
+        r = subprocess.run([exe, "lookup", "application", KEYRING_APP, "username", user, "url", url],
+                           capture_output=True, text=True, timeout=30)
+    except (subprocess.TimeoutExpired, OSError):
+        return None
+    return r.stdout if r.returncode == 0 and r.stdout else None
+
+
+def keyring_store(url: str, user: str, password: str) -> bool:
+    exe = _secret_tool()
+    if not exe:
+        return False
+    try:
+        r = subprocess.run([exe, "store", f"--label=SayWhen ({user})", "application", KEYRING_APP,
+                            "username", user, "url", url],
+                           input=password, text=True, capture_output=True, timeout=30)
+    except (subprocess.TimeoutExpired, OSError):
+        return False
+    return r.returncode == 0
+
+
+def remove_plain_password(path: Path) -> bool:
+    """Borra la línea `password = …` del config.ini. Devuelve True si había alguna."""
+    if not path.exists():
+        return False
+    lines = path.read_text(encoding="utf-8").splitlines()
+    kept = [ln for ln in lines if not re.match(r"\s*password\s*=", ln)]
+    if len(kept) == len(lines):
+        return False
+    path.write_text("\n".join(kept) + "\n", encoding="utf-8")
+    path.chmod(0o600)
+    return True
+
+
+def _write_plain_password(path: Path, password: str) -> None:
+    remove_plain_password(path)
+    lines = path.read_text(encoding="utf-8").splitlines()
+    idx = next((i for i, ln in enumerate(lines) if ln.strip() == "[radicale]"), -1)
+    lines.insert(idx + 1, f"password = {password}")
+    path.write_text("\n".join(lines) + "\n", encoding="utf-8")
+    path.chmod(0o600)
+
+
 @dataclass
 class Config:
     url: str = ""
@@ -652,6 +708,13 @@ class Config:
             if r.returncode != 0:
                 raise SystemExit(f"password_cmd falló: {r.stderr.strip() or r.returncode}")
             return r.stdout.strip().split("\n")[0]
+        if self.url and self.username:
+            pw = keyring_lookup(self.url, self.username)
+            if pw:
+                return pw
+        if self.password:
+            print("Aviso: la contraseña está en texto plano en config.ini. "
+                  "Muévela al llavero con `saywhen --set-password`.", file=sys.stderr)
         return self.password
 
 
@@ -737,25 +800,49 @@ def check_connection(cfg: Config) -> bool:
     return False
 
 
+def set_password(cfg: Config, path: Path) -> bool:
+    """Guarda la contraseña en el llavero del sistema (y la quita del config.ini si estaba ahí)."""
+    if not cfg.url or not cfg.username:
+        raise SystemExit("Primero configura la URL y el usuario con `saywhen --init`.")
+    pw = getpass.getpass(f"Contraseña de {cfg.username} (se guardará en el llavero; vacío = no cambiarla): ")
+    if not pw:
+        print("No se cambió la contraseña.")
+        return False
+    if not _secret_tool():
+        print("No encuentro `secret-tool` (paquete libsecret en Fedora/Arch, libsecret-tools en Debian/Ubuntu).\n"
+              "Instálalo y repite `saywhen --set-password`, o usa password_cmd / SAYWHEN_PASSWORD.")
+        if input("¿Guardarla mientras tanto en texto plano en config.ini (permisos 600)? [s/N] ").strip().lower() \
+                in ("s", "si", "sí", "y", "yes"):
+            _write_plain_password(path, pw)
+            print("Guardada en texto plano. Mejor muévela al llavero en cuanto puedas.")
+        return False
+    if not keyring_store(cfg.url, cfg.username, pw):
+        print("No pude guardarla en el llavero (¿está bloqueado o no hay sesión de escritorio?).")
+        return False
+    if remove_plain_password(path):
+        print("✓ Contraseña guardada en el llavero y borrada del config.ini.")
+    else:
+        print("✓ Contraseña guardada en el llavero.")
+    return True
+
+
 def run_init(path: Path) -> Config:
     print(f"Configuración → {path}\n")
     print("La URL es la de la colección de calendario, p. ej. https://radicale.ejemplo.com/usuario/calendario/")
     url = input("URL del calendario: ").strip()
     user = input("Usuario: ").strip()
-    pw = getpass.getpass("Contraseña (vacío = no guardarla; usa password_cmd o SAYWHEN_PASSWORD): ")
     tz = input(f"Zona horaria [{detect_tz()}]: ").strip() or detect_tz()
-    lines = ["[radicale]", f"url = {url}", f"username = {user}"]
-    lines.append(f"password = {pw}" if pw else "# password_cmd = pass show radicale")
-    lines += [f"timezone = {tz}", "# verify_tls = true", "# date_order = dmy   ; o mdy",
-              "# default_duration = 60", "# pm_guess = true    ; «a las 5» → 17:00"]
+    lines = ["[radicale]", f"url = {url}", f"username = {user}", f"timezone = {tz}",
+             "# La contraseña se guarda en el llavero del sistema (saywhen --set-password).",
+             "# Alternativa: password_cmd = pass show radicale",
+             "# verify_tls = true", "# date_order = dmy   ; o mdy",
+             "# default_duration = 60", "# pm_guess = true    ; «a las 5» → 17:00"]
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text("\n".join(lines) + "\n", encoding="utf-8")
     path.chmod(0o600)
     print("Guardado.\n")
+    set_password(load_config(path), path)
     cfg = load_config(path)
-    if not pw and not cfg.password_cmd:
-        cfg.password = getpass.getpass("Contraseña para probar la conexión: ")
-        os.environ["SAYWHEN_PASSWORD"] = cfg.password
     check_connection(cfg)
     return cfg
 
@@ -843,6 +930,8 @@ def main(argv=None) -> int:
     ap.add_argument("--ics", action="store_true", help="imprimir el .ics generado")
     ap.add_argument("--init", action="store_true", help="crear/actualizar la configuración")
     ap.add_argument("--check", action="store_true", help="probar la conexión con Radicale")
+    ap.add_argument("--set-password", action="store_true",
+                    help="guardar/cambiar la contraseña en el llavero del sistema")
     ap.add_argument("--config", help="ruta alternativa del config.ini")
     ap.add_argument("--selftest", action="store_true", help="ejecutar pruebas del parser")
     args = ap.parse_args(argv)
@@ -855,6 +944,8 @@ def main(argv=None) -> int:
         run_init(path)
         return 0
     cfg = load_config(path)
+    if args.set_password:
+        return 0 if set_password(cfg, path) else 1
     if args.check:
         return 0 if check_connection(cfg) else 1
 
