@@ -51,7 +51,7 @@ def esc(s: str) -> str:
 
 class QuickWindow(Adw.ApplicationWindow):
     def __init__(self, app, cfg):
-        super().__init__(application=app, title="SayWhen")
+        super().__init__(application=app, title="SayWhen [•w•]")
         self.cfg = cfg
         self.event = None
         self.busy = False
